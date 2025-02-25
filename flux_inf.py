@@ -220,14 +220,55 @@ class Model:
 )
 @modal.asgi_app()
 def fastapi_app():
-    from fastapi import FastAPI, HTTPException, Response, Query
+    from fastapi import FastAPI, HTTPException, Response, Query, BackgroundTasks
+    from fastapi.responses import JSONResponse
+    import httpx
+    import asyncio
 
     web_app = FastAPI()
     config = AppConfig()
 
+    def process_and_send_image(callback_url: str, text: str, lora_url: str, lora_name: str):
+        try:
+            download_models.remote(SharedConfig())
+            lora_path = None
+
+            if lora_url and lora_name:
+                lora_path = download_lora_weights.remote(lora_url, lora_name)
+
+            img_bytes = Model().inference.remote(text, lora_path, config)
+
+            if not img_bytes:
+                raise Exception("Image generation failed")
+
+            async def send_image():
+                async with httpx.AsyncClient() as client:
+                    response = await client.post(
+                        callback_url,
+                        files={"file": (f"{text.replace(' ', '_')}.png", img_bytes, "image/png")}
+                    )
+                    if response.status_code != 200:
+                        raise Exception("Failed to send image to callback URL")
+
+            asyncio.run(send_image())
+            
+        except Exception as e:
+            print(f"Error processing image: {e}")
+
+
     @web_app.get("/health")
     async def health():
         return "Healthy"
+    
+    @web_app.get("/infer_async")
+    async def infer_async(background_tasks: BackgroundTasks,
+                    text: str = "Render a dynamic male image of in a futuristic, neon-lit cityscape with bold contrasts and cinematic lighting, evoking energy, creativity, and modern sophistication looking opposite to the camera", 
+                    lora_url: str = Query(None, description="URL to download LoRA weights from"),
+                    lora_name: str = Query(None, description="Name to save the LoRA weights as"), 
+                    callback_url: str = Query(None, description="Callback URL to hit after Inference")):
+        
+        background_tasks.add_task(process_and_send_image, callback_url, text, lora_url, lora_name)
+        return JSONResponse(content={"message": "Request received, processing in background"})
 
     @web_app.get("/infer")
     async def infer(text: str = "Render a dynamic male image of in a futuristic, neon-lit cityscape with bold contrasts and cinematic lighting, evoking energy, creativity, and modern sophistication looking opposite to the camera", 
@@ -239,16 +280,20 @@ def fastapi_app():
             
             
             if lora_url and lora_name:
-                print("Trying to download the lora weights")
+                # LOG
+                # print("Trying to download the lora weights")
+
                 lora_path = download_lora_weights.remote(lora_url, lora_name)
+
                 # return Response(
                 # content=lora_path,
                 # media_type="text",
                 # )
             
-
             img_bytes = Model().inference.remote(text, lora_path, config) 
-            # img_bytes = None
+            
+            # TODO
+            # Push the Image to Object Store
 
             if not img_bytes:
                 raise HTTPException(status_code=404, detail="Image generation failed")
@@ -261,6 +306,7 @@ def fastapi_app():
                     "Content-Disposition": f"inline; filename={text.replace(' ', '_')}.png"
                 }
             )
+        
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
 
