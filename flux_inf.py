@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from pathlib import Path
 import modal
+from modal import Volume, Image, Mount
 
 
 # Setup
@@ -48,7 +49,6 @@ image = image.env(
 
 web_image = image
 
-
 @dataclass
 class SharedConfig:
     """Configuration information shared across project components."""
@@ -59,8 +59,8 @@ class SharedConfig:
 @dataclass
 class AppConfig(SharedConfig):
     """Configuration information for inference."""
-    num_inference_steps: int = 5
-    guidance_scale: float = 6
+    num_inference_steps: int = 28
+    guidance_scale: float = 3.5
 
 @dataclass
 class TrainConfig(SharedConfig):
@@ -92,61 +92,117 @@ huggingface_secret = modal.Secret.from_name(
     "huggingface-secret", required_keys=["HF_TOKEN"]
 )
 
-
-@app.function(
-    image=image,
-    gpu="A100-80GB",  # fine-tuning is VRAM-heavy and requires a high-VRAM GPU
-    volumes={MODEL_DIR: volume},  # stores fine-tuned model
-    timeout=1800,  # 30 minutes
-    secrets=[huggingface_secret]
-    + (
-        [
-            modal.Secret.from_name(
-                "wandb-secret", required_keys=["WANDB_API_KEY"]
-            )
-        ]
-        if USE_WANDB
-        else []
-    ),
+volume = modal.Volume.from_name(
+    "flux-models", create_if_missing=True
 )
-def train(instance_example_urls, config):
+
+MODEL_DIR = "/model"
+LORA_DIR = "/lora_adapters"
+
+# @app.function(
+#     image=image,
+#     gpu="A100-80GB",  # fine-tuning is VRAM-heavy and requires a high-VRAM GPU
+#     volumes={MODEL_DIR: volume},  # stores fine-tuned model
+#     timeout=1800,  # 30 minutes
+#     secrets=[huggingface_secret]
+#     + (
+#         [
+#             modal.Secret.from_name(
+#                 "wandb-secret", required_keys=["WANDB_API_KEY"]
+#             )
+#         ]
+#         if USE_WANDB
+#         else []
+#     ),
+# )
+# def train(instance_example_urls, config):
+#     volume.commit()
+
+# Function to download Flux weights - runs on CPU 
+@app.function(
+    volumes={MODEL_DIR: volume},
+    image=image,
+    secrets=[huggingface_secret],
+    timeout=600,  # 10 minutes
+)
+def download_models(config):
+    import torch
+    from diffusers import DiffusionPipeline
+    from huggingface_hub import snapshot_download
+
+    print("Downloading the Flux Model")
+
+    snapshot_download(
+        config.model_name,
+        local_dir=MODEL_DIR,
+        ignore_patterns=["*.pt", "*.bin"],  # using safetensors
+    )
+
+    DiffusionPipeline.from_pretrained(MODEL_DIR, torch_dtype=torch.bfloat16)
+
+# Function to download LoRA weights - runs on CPU web server
+@app.function(
+    image=web_image,
+    volumes={MODEL_DIR: volume}
+)
+def download_lora_weights(lora_url, lora_name):
+    """Download LoRA weights from URL and save to the shared volume"""
+    import requests
+    import os
+    
+    os.makedirs(f"{MODEL_DIR}{LORA_DIR}", exist_ok=True)
+    lora_path = os.path.join(f"{MODEL_DIR}{LORA_DIR}", f"{lora_name}.safetensors")
+    
+    # Check if we already have the file
+    if os.path.exists(lora_path):
+        return lora_path
+    
+    # Download the file
+    response = requests.get(lora_url)
+    response.raise_for_status()  # Raise an exception for HTTP errors
+    
+    # Save the file
+    with open(lora_path, 'wb') as f:
+        for chunk in response.iter_content(chunk_size=8192):
+            f.write(chunk)
+
     volume.commit()
+    path = MODEL_DIR
 
-@app.cls(image=image, gpu="A100", secrets=[huggingface_secret])
+    return lora_path
+
+@app.cls(image=image, gpu="A100", secrets=[huggingface_secret], volumes={MODEL_DIR: volume})
 class Model:
-    def __init__(self, config):
-        self.config = config
-
-
     @modal.enter()
     def load_model(self):
         import torch
         from diffusers import DiffusionPipeline
-        from huggingface_hub import snapshot_download
 
-
-        snapshot_download(
-        self.config.model_name,
-        # local_dir=MODEL_DIR,
-        ignore_patterns=["*.pt", "*.bin"],  # using safetensors
-        )
-
-        print("Model Donwloaded....")
-
+        volume.reload()
+        
         # set up a hugging face inference pipeline using our model
         pipe = DiffusionPipeline.from_pretrained(
-            # MODEL_DIR,
+            MODEL_DIR,
             torch_dtype=torch.bfloat16,
         ).to("cuda")
-        # pipe.load_lora_weights(MODEL_DIR)
+        
         self.pipe = pipe
 
     @modal.method()
-    def inference(self, text, config):
+    def inference(self, prompt, lora_path, config):
         import io
+        import os
+
+        # Relod the Models to get the lastest volumes
+        volume.reload()
+
+        if lora_path:
+            lora_path = Path(lora_path)
+            # Add the LoRA Adapters
+            self.pipe.load_lora_weights(lora_path)
 
         image = self.pipe(
-            text,
+            prompt,
             num_inference_steps=config.num_inference_steps,
             guidance_scale=config.guidance_scale,
         ).images[0]
@@ -157,7 +213,6 @@ class Model:
 
         return img_byte_arr
 
-
 @app.function(
     image=web_image,
     concurrency_limit=1,
@@ -165,27 +220,36 @@ class Model:
 )
 @modal.asgi_app()
 def fastapi_app():
-    from fastapi import FastAPI, HTTPException, Response
+    from fastapi import FastAPI, HTTPException, Response, Query
 
     web_app = FastAPI()
     config = AppConfig()
-    
 
     @web_app.get("/health")
     async def health():
         return "Healthy"
 
-    @web_app.get("/train")
-    async def train_model(image_zip, trigger_word):
-        
-
-
     @web_app.get("/infer")
-    async def infer(text: str = "Mount Everest"):
+    async def infer(text: str = "Render a dynamic male image of in a futuristic, neon-lit cityscape with bold contrasts and cinematic lighting, evoking energy, creativity, and modern sophistication looking opposite to the camera", 
+                    lora_url: str = Query(None, description="URL to download LoRA weights from"),
+                    lora_name: str = Query(None, description="Name to save the LoRA weights as")):
+        
         try:
-            model = Model(config)
-            img_bytes = model.inference.remote(text, config)
+            download_models.remote(SharedConfig())
             
+            
+            if lora_url and lora_name:
+                print("Trying to download the lora weights")
+                lora_path = download_lora_weights.remote(lora_url, lora_name)
+                # return Response(
+                # content=lora_path,
+                # media_type="text",
+                # )
+            
+
+            img_bytes = Model().inference.remote(text, lora_path, config) 
+            # img_bytes = None
+
             if not img_bytes:
                 raise HTTPException(status_code=404, detail="Image generation failed")
             

@@ -1,3 +1,4 @@
 .env
 __pycache__
 result.png
+.DS_Store
