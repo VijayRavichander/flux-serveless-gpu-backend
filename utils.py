@@ -37,11 +37,12 @@ def load_images(zipped_images_url: str) -> Path:
     print_curr_dir(img_path)
     return img_path
 
-def upload_to_r2(local_model_path, model_id):
+def upload_model_to_r2(local_model_path, model_id):
     import boto3
     import os
     from pathlib import Path
     
+    public_r2_url = "https://pub-147823d083d74652ac0a76bbe364f95d.r2.dev"
     # Get R2 credentials from the environment
     access_key = os.environ["R2_ACCESS_KEY_ID"]
     secret_key = os.environ["R2_SECRET_ACCESS_KEY"]
@@ -61,7 +62,7 @@ def upload_to_r2(local_model_path, model_id):
         if file_path.is_file():
             # Create relative path for S3 key
             relative_path = file_path.relative_to(local_model_path)
-            s3_key = f"models/{model_id}/{relative_path}"
+            s3_key = f"trained_models/{model_id}/{relative_path}"
             
             print(f"Uploading {file_path} to {s3_key}")
             s3_client.upload_file(
@@ -70,5 +71,39 @@ def upload_to_r2(local_model_path, model_id):
                 s3_key
             )
     
-    print(f"Model successfully uploaded to R2 bucket: {bucket_name}/models/{model_id}")
-    return f"{endpoint_url}/{bucket_name}/trained_models/{model_id}"
+    print(f"Model successfully uploaded to R2 bucket: {bucket_name}/trained_models/{model_id}")
+    return f"{public_r2_url}/trained_models/{model_id}/pytorch_lora_weights.safetensors"
+
+
+def upload_image_to_r2(img_byte_arr, image_id):
+    import boto3
+    import os
+    from pathlib import Path
+    import uuid
+    import time
+    
+    # Get R2 credentials from the environment
+    access_key = os.environ["R2_ACCESS_KEY_ID"]
+    secret_key = os.environ["R2_SECRET_ACCESS_KEY"]
+    endpoint_url = os.environ["R2_ENDPOINT_URL"]
+    bucket_name = os.environ["R2_BUCKET_NAME"]
+    public_r2_url = "https://pub-147823d083d74652ac0a76bbe364f95d.r2.dev"
+    filename = f"generated_images/{image_id}.jpeg"
+
+    # Create S3 client (R2 is S3-compatible)
+    s3_client = boto3.client(
+        's3',
+        endpoint_url=endpoint_url,
+        aws_access_key_id=access_key,
+        aws_secret_access_key=secret_key
+    )
+
+    s3_client.put_object(
+        Bucket=bucket_name,
+        Key=filename,
+        Body=img_byte_arr,
+        ContentType='image/jpeg'
+    )
+
+    print(f"Image successfully uploaded to R2 bucket: {bucket_name}/generated_images/{image_id}")
+    return f"{public_r2_url}/generated_images/{image_id}.jpeg"
