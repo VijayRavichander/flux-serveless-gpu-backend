@@ -175,7 +175,7 @@ def download_models(config):
     print("Downloading the Flux Model")
     snapshot_download(
         config.model_name,
-        local_dir=f"{MODEL_DIR}/.cache/huggingface",
+        local_dir=f"{MODEL_DIR}/.cache/huggingface/",
         ignore_patterns=["*.pt", "*.bin"],  # using safetensors
     )
     end = time.time()
@@ -253,6 +253,11 @@ class Model:
 
 
         volume.commit()
+
+    @modal.exit()
+    def del_dir(self):
+        volume.remove_file(f'/.cache/huggingface/', recursive=True)
+        print("Shutting Down")
 
     @modal.method()
     def inference(self, prompt, lora_path, config):
