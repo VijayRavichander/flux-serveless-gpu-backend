@@ -42,7 +42,7 @@ def upload_model_to_r2(local_model_path, model_id):
     import os
     from pathlib import Path
     
-    public_r2_url = "https://pub-147823d083d74652ac0a76bbe364f95d.r2.dev"
+    public_r2_url = os.environ["R2_PUBLIC_URL"]
     # Get R2 credentials from the environment
     access_key = os.environ["R2_ACCESS_KEY_ID"]
     secret_key = os.environ["R2_SECRET_ACCESS_KEY"]
@@ -87,7 +87,7 @@ def upload_image_to_r2(img_byte_arr, image_id):
     secret_key = os.environ["R2_SECRET_ACCESS_KEY"]
     endpoint_url = os.environ["R2_ENDPOINT_URL"]
     bucket_name = os.environ["R2_BUCKET_NAME"]
-    public_r2_url = "https://pub-147823d083d74652ac0a76bbe364f95d.r2.dev"
+    public_r2_url = os.environ["R2_PUBLIC_URL"]
     filename = f"generated_images/{image_id}.jpeg"
 
     # Create S3 client (R2 is S3-compatible)

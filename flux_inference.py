@@ -3,7 +3,7 @@ from pathlib import Path
 import modal
 from modal import Volume, Image, Mount
 from config import SharedConfig, AppConfig, TrainConfig
-from utils import print_curr_dir, load_images, upload_model_to_r2, upload_image_to_r2
+from utils import load_images, upload_model_to_r2, upload_image_to_r2
 
 #### ------------------------- Setup & Image ------------------------- 
 app = modal.App(name="example-dreambooth-flux")
@@ -79,7 +79,7 @@ MODEL_ID = SharedConfig().model_name
 ###  ------------------------- Train -------------------------
 @app.function(
     image=image,
-    gpu="A100-80GB", # fine-tuning is VRAM-heavy and requires a high-VRAM GPU
+    gpu="H100", # fine-tuning is VRAM-heavy and requires a high-VRAM GPU
     volumes={MODEL_DIR: volume},  # stores fine-tuned model
     timeout=1200,  # 20 minutes
     secrets=[huggingface_secret, r2_secret],
@@ -159,8 +159,6 @@ def train(images_data_url, steps, trigger_word, uuid):
         return None
 #  ------------------------- x -------------------------
 
-
-
 #  ------------------------- Download Weights -------------------------
 
 # Function to download Flux weights - runs on CPU 
@@ -230,7 +228,6 @@ def download_lora_weights(lora_url, lora_name):
 
 #  ------------------------- x -------------------------
 
-
 @app.cls(image=image, gpu="A100", secrets=[huggingface_secret], volumes={MODEL_DIR: volume})
 class Model:
     @modal.enter()
@@ -299,7 +296,8 @@ class Model:
     image=web_image,
     concurrency_limit=1,
     allow_concurrent_inputs=1000,
-    secrets=[r2_secret]
+    secrets=[r2_secret],
+    timeout= 60 * 40
 )
 @modal.asgi_app()
 def fastapi_app():
@@ -311,6 +309,7 @@ def fastapi_app():
     import os
     from pathlib import Path
     from pydantic import BaseModel, HttpUrl
+    import time
 
     class TrainModelSyncRequest(BaseModel):
         steps: int = 500
@@ -323,6 +322,9 @@ def fastapi_app():
     class InferenceSyncRequest(BaseModel):
         prompt: str
         lora_url: HttpUrl
+
+    class InferenceAsyncRequest(InferenceSyncRequest):
+        callback_url: HttpUrl
 
 
     web_app = FastAPI()
@@ -397,6 +399,7 @@ def fastapi_app():
     @web_app.post("/train_model_sync")
     async def train_model_sync(request: TrainModelSyncRequest):
         try:
+            res_start = time.time()
             steps = request.steps
             trigger_word = request.trigger_word
             images_data_url = request.images_data_url
@@ -405,7 +408,11 @@ def fastapi_app():
                 raise HTTPException(status_code=400, detail="Missing zipped_url parameter")
             
             id = uuid.uuid4()
+            gpu_start = time.time()
             model_url = train.remote(images_data_url, steps, trigger_word, id)
+            gpu_end = time.time()
+
+            print(f"Time Taken to Train {steps}: {gpu_end - gpu_start} seconds")
 
             if not model_url:
                 raise Exception("Model Training Failed")
@@ -420,7 +427,8 @@ def fastapi_app():
                     "url": model_url
                 }
             }
-
+            res_end = time.time()
+            print(f"Time Take to the entire Request: {res_end - res_start} seconds")
             return JSONResponse(content=response)
         
         except Exception as e:
@@ -449,20 +457,25 @@ def fastapi_app():
             return HTTPException(status_code=500, detail=str(e))
     
     @web_app.post("/infer_async")
-    async def infer_async(background_tasks: BackgroundTasks,
-                    text: str = "Render a dynamic male image of in a futuristic, neon-lit cityscape with bold contrasts and cinematic lighting, evoking energy, creativity, and modern sophistication looking opposite to the camera", 
-                    lora_url: str = Query(None, description="URL to download LoRA weights from"),
-                    lora_name: str = Query(None, description="Name to save the LoRA weights as"), 
-                    callback_url: str = Query(None, description="Callback URL to hit after Inference")):
+    async def infer_async(background_tasks: BackgroundTasks, request: InferenceAsyncRequest):
         
-        # Validate the Query
+        try:
+            # Validate the Query
+            lora_url = request.lora_url
+            prompt = request.prompt
+            callback_url = request.callback_url
 
-        # Pass Request ID to the request
-        
-        # Add to Background Task
-        background_tasks.add_task(generate_image_background, callback_url, text, lora_url, lora_name)
+            id = uuid.uuid4()
 
-        return JSONResponse(content={"message": "Request received, processing in background"})
+            # Add to Background Task 
+            background_tasks.add_task(generate_image_background, callback_url, prompt, lora_url, id)
+
+            response = {"id": id}
+            return JSONResponse(content=response)
+
+                
+        except Exception as e:
+            return HTTPException(status_code=500, detail=str(e))
 
     @web_app.post("/infer_sync")
     async def infer_async(request: InferenceSyncRequest):

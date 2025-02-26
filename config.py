@@ -28,7 +28,7 @@ class TrainConfig(SharedConfig):
 
     # Hyperparameters/constants from the huggingface training example
     resolution: int = 512
-    train_batch_size: int = 3
+    train_batch_size: int = 4
     rank: int = 16  # lora rank
     gradient_accumulation_steps: int = 1
     learning_rate: float = 4e-4
