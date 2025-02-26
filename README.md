@@ -38,6 +38,7 @@ This repository contains a Modal application for fine-tuning FLUX image generati
      - `R2_SECRET_ACCESS_KEY`
      - `R2_ENDPOINT_URL`
      - `R2_BUCKET_NAME`
+     - `R2-PUBLIC-URL`
    - `huggingface-secret` with:
      - `HF_TOKEN`
 
