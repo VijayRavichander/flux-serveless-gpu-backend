@@ -1,7 +1,5 @@
-from dataclasses import dataclass
 from pathlib import Path
 import modal
-from modal import Volume, Image, Mount
 from config import SharedConfig, AppConfig, TrainConfig
 from utils import load_images, upload_model_to_r2, upload_image_to_r2
 
@@ -149,10 +147,7 @@ def train(images_data_url, steps, trigger_word, uuid):
             ])
         
         # Upload model weights to R2 after training
-        print("Uploading model weights to R2 storage...")
         r2_url = upload_model_to_r2(save_path, str(uuid))
-        print(f"Model weights uploaded to R2. Access at: {r2_url}")
-        print("ALL DONE!!!!!!!!!!!!!!!!!")
         return r2_url
 
     except Exception as e:
@@ -314,47 +309,64 @@ def fastapi_app():
     class TrainModelSyncRequest(BaseModel):
         steps: int = 500
         trigger_word: str
-        images_data_url: HttpUrl
+        images_data_url: str
     
     class TrainModelAsyncRequest(TrainModelSyncRequest):
-        callback_url: HttpUrl
+        callback_url: str
 
     class InferenceSyncRequest(BaseModel):
         prompt: str
-        lora_url: HttpUrl
+        lora_url: str
 
     class InferenceAsyncRequest(InferenceSyncRequest):
-        callback_url: HttpUrl
+        callback_url: str
 
 
     web_app = FastAPI()
     config = AppConfig()
     train_config = TrainConfig()
+    
 
-    def generate_image_background(callback_url: str, text: str, lora_url: str, lora_name: str):
+
+    def generate_image_background(callback_url: str, prompt: str, lora_url: str, id: str):
         try:
             download_models.remote(SharedConfig())
             lora_path = None
 
-            if lora_url and lora_name:
-                lora_path = download_lora_weights.remote(lora_url, lora_name)
+            if lora_url:
+                lora_path = download_lora_weights.remote(lora_url, id)
 
-            img_bytes = Model().inference.remote(text, lora_path, config)
+            img_bytes = Model().inference.remote(prompt, lora_path, config)
 
             if not img_bytes:
                 raise Exception("Image generation failed")
 
+            # Push the Image to Object Store
+            image_url = upload_image_to_r2(img_bytes, id)
 
-            async def send_image():
+            if not img_bytes:
+                raise HTTPException(status_code=404, detail="Image generation failed")
+            
+            response = {
+                "images": [
+                    {
+                         "url": image_url,
+                         "content_type": "image/jpeg"
+                    }
+                ],
+                "prompt": prompt
+            }
+
+            async def send_image(response):
                 async with httpx.AsyncClient() as client:
                     response = await client.post(
-                        callback_url,
-                        files={"file": (f"{text.replace(' ', '_')}.png", img_bytes, "image/png")}
+                        str(callback_url),
+                        json = response
                     )
                     if response.status_code != 200:
                         raise Exception("Failed to send image to callback URL")
 
-            asyncio.run(send_image())
+            asyncio.run(send_image(response))
 
         except Exception as e:
             print(f"Error processing image: {e}")
@@ -362,6 +374,7 @@ def fastapi_app():
 
     def train_model_background(callback_url: str, images_data_url, steps: int, trigger_word: str, id: str):
         try:
+            print("running in background train")
             model_url = train.remote(images_data_url, steps, trigger_word, id)
 
             if not model_url:
@@ -371,7 +384,7 @@ def fastapi_app():
                 "config": {
                     "id": str(id),
                     "steps": steps,
-                    "rank": train_config.max_train_steps
+                    "rank": train_config.rank
                 }, 
                 "diffusers_lora_file": {
                     "url": model_url
@@ -390,11 +403,14 @@ def fastapi_app():
             asyncio.run(send_model(response))
 
         except Exception as e:
+            print("Something went wrong")
+            print(e)
             return HTTPException(status_code=500, detail=str(e))
         
     @web_app.get("/health")
     async def health():
         return "Healthy"
+    
 
     @web_app.post("/train_model_sync")
     async def train_model_sync(request: TrainModelSyncRequest):
@@ -450,7 +466,7 @@ def fastapi_app():
             
             background_tasks.add_task(train_model_background, callback_url, images_data_url, steps, trigger_word, id)
 
-            response = {"id": id}
+            response = {"id": str(id)}
             return JSONResponse(content=response)
         
         except Exception as e:
@@ -470,7 +486,7 @@ def fastapi_app():
             # Add to Background Task 
             background_tasks.add_task(generate_image_background, callback_url, prompt, lora_url, id)
 
-            response = {"id": id}
+            response = {"id": str(id)}
             return JSONResponse(content=response)
 
                 
@@ -505,7 +521,8 @@ def fastapi_app():
                          "content_type": "image/jpeg"
                     }
                 ],
-                "prompt": prompt
+                "prompt": prompt, 
+                "id": str(id)
             }
             return JSONResponse(content= response)
         
@@ -516,21 +533,3 @@ def fastapi_app():
 
 
 
-# - `modal run dreambooth_app.py` will train the model. Change the `instance_example_urls_file` to point to your own pet's images.
-# - `modal serve dreambooth_app.py` will [serve](https://modal.com/docs/guide/webhooks#developing-with-modal-serve) the Gradio interface at a temporary location. Great for iterating on code!
-# - `modal shell dreambooth_app.py` is a convenient helper to open a bash [shell](https://modal.com/docs/guide/developing-debugging#interactive-shell) in our image. Great for debugging environment issues.
-
-
-# @app.local_entrypoint()
-# def run(  # add more config params here to make training configurable
-#     max_train_steps: int = 250,
-# ):
-#     print("🎨 loading model")
-#     download_models.remote(SharedConfig())
-#     print("🎨 setting up training")
-#     config = TrainConfig(max_train_steps=max_train_steps)
-#     instance_example_urls = (
-#         Path(TrainConfig.instance_example_urls_file).read_text().splitlines()
-#     )
-#     train.remote(instance_example_urls, config)
-#     print("🎨 training finished")
