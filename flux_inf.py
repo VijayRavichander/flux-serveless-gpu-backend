@@ -2,10 +2,10 @@ from dataclasses import dataclass
 from pathlib import Path
 import modal
 from modal import Volume, Image, Mount
+from config import SharedConfig, AppConfig, TrainConfig
+from utils import print_curr_dir, load_images, upload_to_r2
 
-
-# Setup
-
+#### ------------------------- Setup & Image ------------------------- 
 app = modal.App(name="example-dreambooth-flux")
 
 image = modal.Image.debian_slim(python_version="3.10").pip_install(
@@ -26,6 +26,7 @@ image = modal.Image.debian_slim(python_version="3.10").pip_install(
     "torchvision~=0.16",
     "triton~=2.2.0",
     "wandb==0.17.6",
+    "boto3==1.33.6"
 )
 
 GIT_SHA = (
@@ -47,46 +48,18 @@ image = image.env(
     {"HF_HUB_ENABLE_HF_TRANSFER": "1"}  # turn on faster downloads from HF
 )
 
+image = image.add_local_python_source("config").add_local_python_source("utils")
+
 web_image = image
 
-@dataclass
-class SharedConfig:
-    """Configuration information shared across project components."""
-    # identifier for pretrained models on Hugging Face
-    model_name: str = "black-forest-labs/FLUX.1-dev"
+#### ------------------------- x ------------------------- 
 
+### ------------------------- Secrets & Volumes -------------------------
 
-@dataclass
-class AppConfig(SharedConfig):
-    """Configuration information for inference."""
-    num_inference_steps: int = 28
-    guidance_scale: float = 3.5
-
-@dataclass
-class TrainConfig(SharedConfig):
-    """Configuration for the finetuning step."""
-
-    # training prompt looks like `{PREFIX} {INSTANCE_NAME} the {CLASS_NAME} {POSTFIX}`
-    prefix: str = "a photo of"
-    postfix: str = ""
-
-    # locator for plaintext file with urls for images of target instance
-    instance_example_urls_file: str = str(
-        Path(__file__).parent / "instance_example_urls.txt"
-    )
-
-    # Hyperparameters/constants from the huggingface training example
-    resolution: int = 512
-    train_batch_size: int = 3
-    rank: int = 16  # lora rank
-    gradient_accumulation_steps: int = 1
-    learning_rate: float = 4e-4
-    lr_scheduler: str = "constant"
-    lr_warmup_steps: int = 0
-    max_train_steps: int = 500
-    checkpointing_steps: int = 1000
-    seed: int = 117
-
+# Add R2 secret
+r2_secret = modal.Secret.from_name(
+    "r2-secret", required_keys=["R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY", "R2_ENDPOINT_URL", "R2_BUCKET_NAME"]
+)
 
 huggingface_secret = modal.Secret.from_name(
     "huggingface-secret", required_keys=["HF_TOKEN"]
@@ -96,27 +69,93 @@ volume = modal.Volume.from_name(
     "flux-models", create_if_missing=True
 )
 
+
 MODEL_DIR = "/model"
 LORA_DIR = "/lora_adapters"
+MODEL_ID = SharedConfig().model_name
 
-# @app.function(
-#     image=image,
-#     gpu="A100-80GB",  # fine-tuning is VRAM-heavy and requires a high-VRAM GPU
-#     volumes={MODEL_DIR: volume},  # stores fine-tuned model
-#     timeout=1800,  # 30 minutes
-#     secrets=[huggingface_secret]
-#     + (
-#         [
-#             modal.Secret.from_name(
-#                 "wandb-secret", required_keys=["WANDB_API_KEY"]
-#             )
-#         ]
-#         if USE_WANDB
-#         else []
-#     ),
-# )
-# def train(instance_example_urls, config):
-#     volume.commit()
+### ------------------------- x -------------------------
+
+###  ------------------------- Train -------------------------
+@app.function(
+    image=image,
+    gpu="A100-80GB", # fine-tuning is VRAM-heavy and requires a high-VRAM GPU
+    # gpu = "L4", 
+    volumes={MODEL_DIR: volume},  # stores fine-tuned model
+    timeout=1200,  # 20 minutes
+    secrets=[huggingface_secret, r2_secret],
+)
+def train(zipped_images_url, config, trigger_word, uuid):
+    from pathlib import Path
+    import subprocess
+    import os
+    from accelerate.utils import write_basic_config
+
+    # set up hugging face accelerate library for fast training
+    write_basic_config(mixed_precision="bf16")
+
+    #load data locally
+    img_path = load_images(zipped_images_url)
+
+    instance_phrase = f"{trigger_word} the person"
+    prompt = f"{config.prefix} {instance_phrase} {config.postfix}".strip()
+    
+    save_path = Path(f'{MODEL_DIR}/trained_models/{uuid}')
+    save_path.mkdir(parents=True, exist_ok=True)
+
+    def _exec_subprocess(cmd: list[str]):
+        """Executes subprocess and prints log to terminal while subprocess is running."""
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        with process.stdout as pipe:
+            for line in iter(pipe.readline, b""):
+                line_str = line.decode()
+                print(f"{line_str}", end="")
+
+        if exitcode := process.wait() != 0:
+            raise subprocess.CalledProcessError(exitcode, "\n".join(cmd))
+    
+    
+    print("launching dreambooth training script")
+    _exec_subprocess(
+        [
+            "accelerate",
+            "launch",
+            "examples/dreambooth/train_dreambooth_lora_flux.py",
+            "--mixed_precision=bf16",  # half-precision floats most of the time for faster training
+            f"--pretrained_model_name_or_path={config.model_name}",
+            f"--instance_data_dir={img_path}",
+            f"--output_dir={save_path}",
+            f"--instance_prompt={prompt}",
+            f"--resolution={config.resolution}",
+            f"--train_batch_size={config.train_batch_size}",
+            f"--gradient_accumulation_steps={config.gradient_accumulation_steps}",
+            f"--learning_rate={config.learning_rate}",
+            f"--lr_scheduler={config.lr_scheduler}",
+            f"--lr_warmup_steps={config.lr_warmup_steps}",
+            f"--max_train_steps={config.max_train_steps}",
+            f"--checkpointing_steps={config.checkpointing_steps}",
+            f"--seed={config.seed}",  # increased reproducibility by seeding the RNG 
+            f"--hub_model_id=flux_lora_modal_test"
+        ])
+    
+    # Upload model weights to R2 after training
+    print("Uploading model weights to R2 storage...")
+    r2_url = upload_to_r2(save_path, str(uuid))
+    print(f"Model weights uploaded to R2. Access at: {r2_url}")
+    
+    print("ALL DONE!!!!!!!!!!!!!!!!!")
+
+#  ------------------------- x -------------------------
+
+
+
+
+
+#  ------------------------- Download Weights -------------------------
 
 # Function to download Flux weights - runs on CPU 
 @app.function(
@@ -129,16 +168,30 @@ def download_models(config):
     import torch
     from diffusers import DiffusionPipeline
     from huggingface_hub import snapshot_download
-
+    from pathlib import Path
+    import os
+    import time
+    start = time.time()
     print("Downloading the Flux Model")
-
     snapshot_download(
         config.model_name,
-        local_dir=MODEL_DIR,
+        local_dir=f"{MODEL_DIR}/.cache/huggingface",
         ignore_patterns=["*.pt", "*.bin"],  # using safetensors
     )
+    end = time.time()
+    print(f"Model Downloaded in {end - start}")
+    # DiffusionPipeline.from_pretrained(
+    #         "black-forest-labs/FLUX.1-dev",
+    #         torch_dtype=torch.bfloat16,
+    #         cache_dir = f"{MODEL_DIR}/.cache/"
+    # )
 
-    DiffusionPipeline.from_pretrained(MODEL_DIR, torch_dtype=torch.bfloat16)
+    volume.commit()
+
+#  ------------------------- x -------------------------
+
+
+#  ------------------------- LoRA Weights Download -------------------------
 
 # Function to download LoRA weights - runs on CPU web server
 @app.function(
@@ -166,10 +219,12 @@ def download_lora_weights(lora_url, lora_name):
         for chunk in response.iter_content(chunk_size=8192):
             f.write(chunk)
 
-    volume.commit()
-    path = MODEL_DIR
-
     return lora_path
+
+
+#  ------------------------- x -------------------------
+
+
 
 @app.cls(image=image, gpu="A100", secrets=[huggingface_secret], volumes={MODEL_DIR: volume})
 class Model:
@@ -177,35 +232,50 @@ class Model:
     def load_model(self):
         import torch
         from diffusers import DiffusionPipeline
+        import time
 
-        volume.reload()
-        
-        # set up a hugging face inference pipeline using our model
-        pipe = DiffusionPipeline.from_pretrained(
-            MODEL_DIR,
+        start = time.time()
+        print("Loading Flux Model")
+
+        # self.pipe = DiffusionPipeline.from_pretrained(
+        #     "black-forest-labs/FLUX.1-dev",
+        #     torch_dtype=torch.bfloat16,
+        #     cache_dir = f"{MODEL_DIR}/.cache/"
+        # ).to("cuda")
+
+        self.pipe = DiffusionPipeline.from_pretrained(
+            f"{MODEL_DIR}/.cache/huggingface",
+            cache_dir = f"{MODEL_DIR}/.cache/huggingface",
             torch_dtype=torch.bfloat16,
         ).to("cuda")
-        
-        self.pipe = pipe
+        end = time.time()
+        print(f"Loaded Flux Model in {end - start} seconds")
+
+
+        volume.commit()
 
     @modal.method()
     def inference(self, prompt, lora_path, config):
         import io
-        import os
+        import os   
 
-        # Relod the Models to get the lastest volumes
         volume.reload()
 
         if lora_path:
             lora_path = Path(lora_path)
             # Add the LoRA Adapters
+            print("Loggging: Trying to download LoRA Weights")
             self.pipe.load_lora_weights(lora_path)
+            print("Loggging: Downloaded LoRA Weights")
 
+
+        print("Running Inference")
         image = self.pipe(
             prompt,
             num_inference_steps=config.num_inference_steps,
             guidance_scale=config.guidance_scale,
         ).images[0]
+        print("Inference Successful")
 
         img_byte_arr = io.BytesIO()
         image.save(img_byte_arr, format='PNG')
@@ -217,13 +287,17 @@ class Model:
     image=web_image,
     concurrency_limit=1,
     allow_concurrent_inputs=1000,
+    secrets=[r2_secret]
 )
 @modal.asgi_app()
 def fastapi_app():
-    from fastapi import FastAPI, HTTPException, Response, Query, BackgroundTasks
+    from fastapi import FastAPI, HTTPException, Response, Query, BackgroundTasks, Request
     from fastapi.responses import JSONResponse
     import httpx
     import asyncio
+    import uuid
+    import os
+    from pathlib import Path
 
     web_app = FastAPI()
     config = AppConfig()
@@ -251,14 +325,38 @@ def fastapi_app():
                         raise Exception("Failed to send image to callback URL")
 
             asyncio.run(send_image())
-            
+
         except Exception as e:
             print(f"Error processing image: {e}")
 
 
+    def train_model_and_commit(callback_url: str, zipped_url: str, id: str):
+        try:
+            train.remote(zipped_url, TrainConfig(), "vijay", id)
+        
+        except Exception as e:
+            return HTTPException(status_code=500, detail=str(e))
+        
     @web_app.get("/health")
     async def health():
         return "Healthy"
+
+    @web_app.post("/train_model")
+    async def train_model(background_tasks: BackgroundTasks,
+        request: Request):
+        try:
+            body = await request.json()
+            zipped_url = body.get("zipped_url")
+
+            if not zipped_url:
+                raise HTTPException(status_code=400, detail="Missing zipped_url parameter")
+            
+            random_uuid = uuid.uuid4()
+            background_tasks.add_task(train_model_and_commit, "", zipped_url, random_uuid)
+
+            return {"process_id": random_uuid}
+        except Exception as e:
+            return HTTPException(status_code=500, detail=str(e))
     
     @web_app.get("/infer_async")
     async def infer_async(background_tasks: BackgroundTasks,
@@ -267,7 +365,13 @@ def fastapi_app():
                     lora_name: str = Query(None, description="Name to save the LoRA weights as"), 
                     callback_url: str = Query(None, description="Callback URL to hit after Inference")):
         
+        # Validate the Query
+
+        # Pass Request ID to the request
+        
+        # Add to Background Task
         background_tasks.add_task(process_and_send_image, callback_url, text, lora_url, lora_name)
+
         return JSONResponse(content={"message": "Request received, processing in background"})
 
     @web_app.get("/infer")
@@ -278,17 +382,8 @@ def fastapi_app():
         try:
             download_models.remote(SharedConfig())
             
-            
             if lora_url and lora_name:
-                # LOG
-                # print("Trying to download the lora weights")
-
                 lora_path = download_lora_weights.remote(lora_url, lora_name)
-
-                # return Response(
-                # content=lora_path,
-                # media_type="text",
-                # )
             
             img_bytes = Model().inference.remote(text, lora_path, config) 
             
@@ -298,6 +393,7 @@ def fastapi_app():
             if not img_bytes:
                 raise HTTPException(status_code=404, detail="Image generation failed")
             
+            # img_bytes = None
             return Response(
                 content=img_bytes,
                 media_type="image/png",
